@@ -1093,6 +1093,18 @@ def review_appeal(db: Session, appeal_id: int, reviewer_id: int, data: AppealRev
     return appeal
 
 
+def _restore_booking_if_no_conflict(db: Session, booking: Booking, opinion: str) -> bool:
+    conflicts = get_active_bookings_for_room(
+        db, booking.room_id, booking.start_time, booking.end_time,
+        exclude_booking_id=booking.id
+    )
+    if conflicts:
+        return False
+    booking.status = BookingStatus.CONFIRMED
+    booking.reviewer_note = f"申诉通过，恢复预约状态：{opinion}"
+    return True
+
+
 def _execute_appeal_approval(db: Session, appeal: Appeal):
     if appeal.appeal_type == AppealType.NO_SHOW.value:
         booking = get_booking(db, appeal.target_id)
@@ -1106,18 +1118,20 @@ def _execute_appeal_approval(db: Session, appeal: Appeal):
             abnormal.is_confirmed = False
             abnormal.confirmed_by = None
             abnormal.confirmed_at = None
-            abnormal.handling_result = f"申诉通过，撤销异常确认：{appeal.review_opinion}"
             booking = get_booking(db, abnormal.booking_id)
             if booking and booking.status == BookingStatus.ABNORMAL:
-                booking.status = BookingStatus.CONFIRMED
-                booking.reviewer_note = f"申诉通过，恢复预约状态：{appeal.review_opinion}"
+                if _restore_booking_if_no_conflict(db, booking, appeal.review_opinion):
+                    abnormal.handling_result = f"申诉通过，撤销异常确认并恢复预约：{appeal.review_opinion}"
+                else:
+                    abnormal.handling_result = f"申诉通过，撤销异常确认，但该时段已有其他预约，无法恢复原预约状态：{appeal.review_opinion}"
     elif appeal.appeal_type == AppealType.DUPLICATE_BOOKING.value:
         booking = get_booking(db, appeal.target_id)
         if booking:
-            booking.status = BookingStatus.CONFIRMED
-            booking.cancel_reason = None
-            booking.cancelled_at = None
-            booking.reviewer_note = f"申诉通过，恢复预约：{appeal.review_opinion}"
+            if _restore_booking_if_no_conflict(db, booking, appeal.review_opinion):
+                booking.cancel_reason = None
+                booking.cancelled_at = None
+            else:
+                booking.reviewer_note = f"申诉通过，但该时段已有其他预约，无法恢复原预约状态：{appeal.review_opinion}"
     elif appeal.appeal_type == AppealType.BLACKLIST.value:
         blacklist = db.query(Blacklist).filter(Blacklist.id == appeal.target_id).first()
         if blacklist:

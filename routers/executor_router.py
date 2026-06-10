@@ -263,3 +263,71 @@ async def cancel_booking(
         }
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
+# ==================== 我的黑名单记录 ====================
+
+@router.get("/blacklist/my", summary="获取我的黑名单记录")
+async def get_my_blacklist(
+    current_user: User = Depends(require_roles([UserRole.EXECUTOR, UserRole.ADMIN])),
+    db: Session = Depends(get_db)
+):
+    records = crud.list_blacklist(db, user_id=current_user.id)
+    return [
+        {
+            "id": r.id,
+            "user_id": r.user_id,
+            "reason": r.reason,
+            "start_date": r.start_date,
+            "end_date": r.end_date,
+            "is_active": r.is_active,
+            "created_at": r.created_at
+        }
+        for r in records
+    ]
+
+
+# ==================== 我的异常记录 ====================
+
+@router.get("/abnormal-records/my", summary="获取我的异常记录")
+async def get_my_abnormal_records(
+    is_confirmed: bool = None,
+    page: int = 1,
+    page_size: int = 50,
+    current_user: User = Depends(require_roles([UserRole.EXECUTOR, UserRole.ADMIN])),
+    db: Session = Depends(get_db)
+):
+    skip = (page - 1) * page_size
+    from models import AbnormalRecord, Booking
+    query = db.query(AbnormalRecord).join(
+        Booking, AbnormalRecord.booking_id == Booking.id
+    ).filter(Booking.user_id == current_user.id)
+    if is_confirmed is not None:
+        query = query.filter(AbnormalRecord.is_confirmed == is_confirmed)
+    total = query.count()
+    records = query.order_by(AbnormalRecord.created_at.desc()).offset(skip).limit(page_size).all()
+    items = []
+    for record in records:
+        booking = crud.get_booking(db, record.booking_id)
+        items.append({
+            "id": record.id,
+            "booking_id": record.booking_id,
+            "booking_info": {
+                "id": booking.id,
+                "room_name": booking.room.name if booking and booking.room else "未知",
+                "start_time": booking.start_time if booking else None,
+                "end_time": booking.end_time if booking else None,
+                "status": booking.status if booking else None
+            } if booking else None,
+            "abnormal_type": record.abnormal_type,
+            "description": record.description,
+            "is_confirmed": record.is_confirmed,
+            "handling_result": record.handling_result,
+            "created_at": record.created_at
+        })
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "page_size": page_size
+    }
