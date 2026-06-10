@@ -4,14 +4,15 @@ from sqlalchemy.orm import Session
 from sqlalchemy import and_, or_, func
 from models import (
     User, PracticeRoom, TimeSlot, BookingRule, Blacklist,
-    Lock, Booking, AbnormalRecord, LockStatus, BookingStatus, UserRole
+    Lock, Booking, AbnormalRecord, LockStatus, BookingStatus, UserRole,
+    Appeal, AppealStatus, AppealType
 )
 from schemas import (
     UserCreate, UserUpdate, PracticeRoomCreate, PracticeRoomUpdate,
     TimeSlotCreate, TimeSlotUpdate, BookingRuleUpdate,
     BlacklistCreate, BlacklistUpdate, LockCreate, LockExtend,
     BookingCreate, BookingCancel, AbnormalRecordCreate, AbnormalRecordConfirm,
-    PasswordChange
+    PasswordChange, AppealCreate, AppealReview
 )
 from auth import hash_password, verify_password
 
@@ -929,3 +930,238 @@ def process_auto_no_show(db: Session) -> int:
 
     db.commit()
     return count
+
+
+# ==================== Appeal CRUD ====================
+
+def create_appeal(db: Session, user_id: int, data: AppealCreate) -> Appeal:
+    if data.appeal_type == AppealType.NO_SHOW:
+        booking = get_booking(db, data.target_id)
+        if not booking:
+            raise ValueError("预约记录不存在")
+        if booking.user_id != user_id:
+            raise ValueError("只能对自己的预约记录申诉")
+        if booking.status != BookingStatus.NO_SHOW:
+            raise ValueError("该预约状态不是爽约，无需申诉")
+    elif data.appeal_type == AppealType.ABNORMAL:
+        abnormal = db.query(AbnormalRecord).filter(AbnormalRecord.id == data.target_id).first()
+        if not abnormal:
+            raise ValueError("异常记录不存在")
+        booking = get_booking(db, abnormal.booking_id)
+        if booking and booking.user_id != user_id:
+            raise ValueError("只能对自己的异常记录申诉")
+        if not abnormal.is_confirmed:
+            raise ValueError("该异常记录尚未确认，无需申诉")
+    elif data.appeal_type == AppealType.DUPLICATE_BOOKING:
+        booking = get_booking(db, data.target_id)
+        if not booking:
+            raise ValueError("预约记录不存在")
+        if booking.user_id != user_id:
+            raise ValueError("只能对自己的预约记录申诉")
+        if booking.status != BookingStatus.CANCELLED or not (booking.cancel_reason and "重复预约" in booking.cancel_reason):
+            raise ValueError("该预约不是重复预约取消，无需申诉")
+    elif data.appeal_type == AppealType.BLACKLIST:
+        blacklist = db.query(Blacklist).filter(Blacklist.id == data.target_id).first()
+        if not blacklist:
+            raise ValueError("黑名单记录不存在")
+        if blacklist.user_id != user_id:
+            raise ValueError("只能对自己的黑名单记录申诉")
+        if not blacklist.is_active:
+            raise ValueError("该黑名单记录已失效，无需申诉")
+    else:
+        raise ValueError("不支持的申诉类型")
+
+    pending_appeal = db.query(Appeal).filter(
+        Appeal.user_id == user_id,
+        Appeal.target_type == data.target_type,
+        Appeal.target_id == data.target_id,
+        Appeal.status == AppealStatus.PENDING
+    ).first()
+    if pending_appeal:
+        raise ValueError("该记录已有待处理的申诉，请等待审核结果")
+
+    appeal = Appeal(
+        user_id=user_id,
+        appeal_type=data.appeal_type.value,
+        target_type=data.target_type,
+        target_id=data.target_id,
+        reason=data.reason,
+        supplement=data.supplement,
+        status=AppealStatus.PENDING
+    )
+    db.add(appeal)
+    db.commit()
+    db.refresh(appeal)
+    return appeal
+
+
+def get_appeal(db: Session, appeal_id: int) -> Optional[Appeal]:
+    return db.query(Appeal).filter(Appeal.id == appeal_id).first()
+
+
+def get_appeal_target_info(db: Session, appeal: Appeal) -> Optional[dict]:
+    if appeal.target_type == "Booking" or appeal.appeal_type in [AppealType.NO_SHOW.value, AppealType.DUPLICATE_BOOKING.value]:
+        booking = get_booking(db, appeal.target_id)
+        if booking:
+            return {
+                "id": booking.id,
+                "room_name": booking.room.name if booking.room else "未知",
+                "room_id": booking.room_id,
+                "start_time": booking.start_time,
+                "end_time": booking.end_time,
+                "status": booking.status,
+                "purpose": booking.purpose,
+                "cancel_reason": booking.cancel_reason,
+                "reviewer_note": booking.reviewer_note
+            }
+    elif appeal.target_type == "AbnormalRecord" or appeal.appeal_type == AppealType.ABNORMAL.value:
+        abnormal = db.query(AbnormalRecord).filter(AbnormalRecord.id == appeal.target_id).first()
+        if abnormal:
+            booking = get_booking(db, abnormal.booking_id)
+            return {
+                "id": abnormal.id,
+                "abnormal_type": abnormal.abnormal_type,
+                "description": abnormal.description,
+                "is_confirmed": abnormal.is_confirmed,
+                "handling_result": abnormal.handling_result,
+                "booking_id": abnormal.booking_id,
+                "booking_info": {
+                    "room_name": booking.room.name if booking and booking.room else "未知",
+                    "user_name": booking.user.real_name if booking and booking.user else "未知",
+                    "start_time": booking.start_time if booking else None,
+                    "end_time": booking.end_time if booking else None,
+                    "status": booking.status if booking else None
+                } if booking else None
+            }
+    elif appeal.target_type == "Blacklist" or appeal.appeal_type == AppealType.BLACKLIST.value:
+        blacklist = db.query(Blacklist).filter(Blacklist.id == appeal.target_id).first()
+        if blacklist:
+            return {
+                "id": blacklist.id,
+                "reason": blacklist.reason,
+                "start_date": blacklist.start_date,
+                "end_date": blacklist.end_date,
+                "is_active": blacklist.is_active,
+                "added_by_name": blacklist.admin.real_name if blacklist.admin else "未知"
+            }
+    return None
+
+
+def list_appeals(
+    db: Session,
+    status: Optional[AppealStatus] = None,
+    appeal_type: Optional[AppealType] = None,
+    user_id: Optional[int] = None,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    skip: int = 0,
+    limit: int = 100
+) -> Tuple[List[Appeal], int]:
+    query = db.query(Appeal)
+    if status:
+        query = query.filter(Appeal.status == status)
+    if appeal_type:
+        query = query.filter(Appeal.appeal_type == appeal_type)
+    if user_id:
+        query = query.filter(Appeal.user_id == user_id)
+    if start_date:
+        query = query.filter(Appeal.created_at >= datetime.combine(start_date, datetime.min.time()))
+    if end_date:
+        query = query.filter(Appeal.created_at <= datetime.combine(end_date, datetime.max.time()))
+    total = query.count()
+    appeals = query.order_by(Appeal.created_at.desc()).offset(skip).limit(limit).all()
+    return appeals, total
+
+
+def review_appeal(db: Session, appeal_id: int, reviewer_id: int, data: AppealReview) -> Appeal:
+    appeal = get_appeal(db, appeal_id)
+    if not appeal:
+        raise ValueError("申诉记录不存在")
+    if appeal.status != AppealStatus.PENDING:
+        raise ValueError("该申诉已处理，无法重复审核")
+
+    appeal.status = data.status
+    appeal.reviewer_id = reviewer_id
+    appeal.review_opinion = data.review_opinion
+    appeal.reviewed_at = datetime.now()
+
+    if data.status == AppealStatus.APPROVED:
+        _execute_appeal_approval(db, appeal)
+
+    db.commit()
+    db.refresh(appeal)
+    return appeal
+
+
+def _execute_appeal_approval(db: Session, appeal: Appeal):
+    if appeal.appeal_type == AppealType.NO_SHOW.value:
+        booking = get_booking(db, appeal.target_id)
+        if booking:
+            booking.status = BookingStatus.CANCELLED
+            booking.cancel_reason = f"申诉通过，取消爽约标记：{appeal.review_opinion}"
+            booking.cancelled_at = datetime.now()
+    elif appeal.appeal_type == AppealType.ABNORMAL.value:
+        abnormal = db.query(AbnormalRecord).filter(AbnormalRecord.id == appeal.target_id).first()
+        if abnormal:
+            abnormal.is_confirmed = False
+            abnormal.confirmed_by = None
+            abnormal.confirmed_at = None
+            abnormal.handling_result = f"申诉通过，撤销异常确认：{appeal.review_opinion}"
+            booking = get_booking(db, abnormal.booking_id)
+            if booking and booking.status == BookingStatus.ABNORMAL:
+                booking.status = BookingStatus.CONFIRMED
+                booking.reviewer_note = f"申诉通过，恢复预约状态：{appeal.review_opinion}"
+    elif appeal.appeal_type == AppealType.DUPLICATE_BOOKING.value:
+        booking = get_booking(db, appeal.target_id)
+        if booking:
+            booking.status = BookingStatus.CONFIRMED
+            booking.cancel_reason = None
+            booking.cancelled_at = None
+            booking.reviewer_note = f"申诉通过，恢复预约：{appeal.review_opinion}"
+    elif appeal.appeal_type == AppealType.BLACKLIST.value:
+        blacklist = db.query(Blacklist).filter(Blacklist.id == appeal.target_id).first()
+        if blacklist:
+            blacklist.is_active = False
+            blacklist.end_date = datetime.now()
+            blacklist.reason = f"{blacklist.reason}（申诉通过解除：{appeal.review_opinion}）"
+
+
+def get_appeal_statistics(db: Session, days: int = 30) -> dict:
+    since = datetime.now() - timedelta(days=days)
+
+    total_count = db.query(Appeal).filter(Appeal.created_at >= since).count()
+    pending_count = db.query(Appeal).filter(
+        Appeal.created_at >= since,
+        Appeal.status == AppealStatus.PENDING
+    ).count()
+    approved_count = db.query(Appeal).filter(
+        Appeal.created_at >= since,
+        Appeal.status == AppealStatus.APPROVED
+    ).count()
+    rejected_count = db.query(Appeal).filter(
+        Appeal.created_at >= since,
+        Appeal.status == AppealStatus.REJECTED
+    ).count()
+
+    type_counts = db.query(
+        Appeal.appeal_type,
+        func.count(Appeal.id).label('count')
+    ).filter(
+        Appeal.created_at >= since
+    ).group_by(Appeal.appeal_type).all()
+
+    type_stats = {}
+    for t, c in type_counts:
+        type_stats[t] = c
+
+    approval_rate = approved_count / total_count * 100 if total_count > 0 else 0
+
+    return {
+        "stat_days": days,
+        "total_count": total_count,
+        "pending_count": pending_count,
+        "approved_count": approved_count,
+        "rejected_count": rejected_count,
+        "approval_rate": round(approval_rate, 2),
+        "type_breakdown": type_stats
+    }

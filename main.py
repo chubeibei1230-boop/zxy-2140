@@ -15,6 +15,7 @@ from routers.admin_router import router as admin_router
 from routers.executor_router import router as executor_router
 from routers.reviewer_router import router as reviewer_router
 from routers.query_router import router as query_router
+from routers.appeal_router import router as appeal_router
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -245,6 +246,7 @@ app.include_router(admin_router)
 app.include_router(executor_router)
 app.include_router(reviewer_router)
 app.include_router(query_router)
+app.include_router(appeal_router)
 
 
 @app.get("/", tags=["系统"], summary="健康检查")

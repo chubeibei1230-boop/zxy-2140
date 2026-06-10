@@ -27,6 +27,19 @@ class BookingStatus(str, enum.Enum):
     ABNORMAL = "abnormal"
 
 
+class AppealType(str, enum.Enum):
+    NO_SHOW = "no_show"
+    ABNORMAL = "abnormal"
+    DUPLICATE_BOOKING = "duplicate_booking"
+    BLACKLIST = "blacklist"
+
+
+class AppealStatus(str, enum.Enum):
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+
+
 class User(Base):
     __tablename__ = "users"
 
@@ -44,6 +57,7 @@ class User(Base):
     locks = relationship("Lock", back_populates="user", foreign_keys="Lock.user_id", cascade="all, delete-orphan")
     bookings = relationship("Booking", back_populates="user", foreign_keys="Booking.user_id", cascade="all, delete-orphan")
     blacklist_records = relationship("Blacklist", back_populates="user", foreign_keys="Blacklist.user_id", cascade="all, delete-orphan")
+    appeals = relationship("Appeal", back_populates="user", foreign_keys="Appeal.user_id", cascade="all, delete-orphan")
 
 
 class PracticeRoom(Base):
@@ -190,3 +204,24 @@ class OperationLog(Base):
     created_at = Column(DateTime, server_default=func.now(), index=True)
 
     operator = relationship("User", foreign_keys=[user_id])
+
+
+class Appeal(Base):
+    __tablename__ = "appeals"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    appeal_type = Column(String(50), nullable=False)
+    target_type = Column(String(50), nullable=False)
+    target_id = Column(Integer, nullable=False)
+    reason = Column(Text, nullable=False)
+    supplement = Column(Text)
+    status = Column(String(20), nullable=False, default=AppealStatus.PENDING)
+    reviewer_id = Column(Integer, ForeignKey("users.id"))
+    review_opinion = Column(Text)
+    reviewed_at = Column(DateTime)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    user = relationship("User", back_populates="appeals", foreign_keys=[user_id])
+    reviewer = relationship("User", foreign_keys=[reviewer_id])

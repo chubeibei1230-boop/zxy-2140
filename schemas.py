@@ -1,7 +1,7 @@
 from pydantic import BaseModel, Field, field_validator
 from typing import Optional, List
 from datetime import datetime, date, time
-from models import UserRole, LockStatus, BookingStatus
+from models import UserRole, LockStatus, BookingStatus, AppealType, AppealStatus
 
 
 class UserBase(BaseModel):
@@ -338,3 +338,46 @@ class OperationLogResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class AppealCreate(BaseModel):
+    appeal_type: AppealType
+    target_type: str
+    target_id: int
+    reason: str = Field(..., min_length=1)
+    supplement: Optional[str] = None
+
+
+class AppealReview(BaseModel):
+    status: AppealStatus
+    review_opinion: str = Field(..., min_length=1)
+
+
+class AppealResponse(BaseModel):
+    id: int
+    user_id: int
+    user_name: str
+    appeal_type: AppealType
+    target_type: str
+    target_id: int
+    target_info: Optional[dict]
+    reason: str
+    supplement: Optional[str]
+    status: AppealStatus
+    reviewer_id: Optional[int]
+    reviewer_name: Optional[str]
+    review_opinion: Optional[str]
+    reviewed_at: Optional[datetime]
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class AppealQueryParams(BaseModel):
+    status: Optional[AppealStatus] = None
+    appeal_type: Optional[AppealType] = None
+    user_id: Optional[int] = None
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None
