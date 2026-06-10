@@ -380,10 +380,13 @@ async def query_feedbacks(
     db: Session = Depends(get_db)
 ):
     skip = (page - 1) * page_size
+    effective_user_id = user_id
+    if current_user.role not in [UserRole.ADMIN, UserRole.REVIEWER]:
+        effective_user_id = current_user.id
     feedbacks, total = crud.list_feedbacks(
         db,
         room_id=room_id,
-        user_id=user_id,
+        user_id=effective_user_id,
         start_date=start_date,
         end_date=end_date,
         min_rating=min_rating,
@@ -452,7 +455,7 @@ async def get_feedback_statistics(
 @router.get("/stats/room-feedback-overview", summary="各练习室反馈概览")
 async def get_room_feedback_overview(
     days: int = Query(30, ge=1, le=365, description="统计天数"),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_roles([UserRole.ADMIN, UserRole.REVIEWER])),
     db: Session = Depends(get_db)
 ):
     overview = crud.get_room_feedback_overview(db, days=days)
