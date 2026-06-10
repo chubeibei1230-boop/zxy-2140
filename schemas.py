@@ -1,7 +1,7 @@
 from pydantic import BaseModel, Field, field_validator
 from typing import Optional, List
 from datetime import datetime, date, time
-from models import UserRole, LockStatus, BookingStatus, AppealType, AppealStatus, WaitlistStatus
+from models import UserRole, LockStatus, BookingStatus, AppealType, AppealStatus, WaitlistStatus, FeedbackStatus
 
 
 class UserBase(BaseModel):
@@ -433,3 +433,53 @@ class WaitlistQueryParams(BaseModel):
     user_id: Optional[int] = None
     start_date: Optional[date] = None
     end_date: Optional[date] = None
+
+
+class FeedbackSubmit(BaseModel):
+    actual_usage: Optional[str] = None
+    equipment_rating: int = Field(..., ge=1, le=5)
+    environment_rating: int = Field(..., ge=1, le=5)
+    overall_rating: int = Field(..., ge=1, le=5)
+    problem_description: Optional[str] = None
+    needs_follow_up: bool = Field(default=False)
+
+
+class FeedbackHandle(BaseModel):
+    handling_result: str = Field(..., min_length=1)
+
+
+class FeedbackResponse(BaseModel):
+    id: int
+    booking_id: int
+    user_id: int
+    user_name: str
+    room_id: Optional[int] = None
+    room_name: Optional[str] = None
+    check_out_time: datetime
+    actual_usage: Optional[str] = None
+    equipment_rating: int
+    environment_rating: int
+    overall_rating: int
+    problem_description: Optional[str] = None
+    needs_follow_up: bool
+    status: FeedbackStatus
+    handled_by_name: Optional[str] = None
+    handled_at: Optional[datetime] = None
+    handling_result: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+    booking_info: Optional[dict] = None
+
+    class Config:
+        from_attributes = True
+
+
+class FeedbackQueryParams(BaseModel):
+    room_id: Optional[int] = None
+    user_id: Optional[int] = None
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None
+    min_rating: Optional[int] = Field(default=None, ge=1, le=5)
+    max_rating: Optional[int] = Field(default=None, ge=1, le=5)
+    status: Optional[FeedbackStatus] = None
+    needs_follow_up: Optional[bool] = None

@@ -5,7 +5,8 @@ from database import get_db
 from models import User, UserRole
 from schemas import (
     LockCreate, LockExtend,
-    BookingCreate, BookingCancel
+    BookingCreate, BookingCancel,
+    FeedbackSubmit
 )
 from auth import require_roles, log_operation, get_current_user
 import crud
@@ -263,6 +264,78 @@ async def cancel_booking(
         }
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
+@router.post("/bookings/{booking_id}/check-out", summary="预约签退并提交反馈")
+async def check_out_booking(
+    booking_id: int,
+    data: FeedbackSubmit,
+    request: Request,
+    current_user: User = Depends(require_roles([UserRole.EXECUTOR, UserRole.ADMIN])),
+    db: Session = Depends(get_db)
+):
+    try:
+        feedback = crud.check_out_and_submit_feedback(db, booking_id, current_user.id, data)
+        log_operation(
+            db, current_user.id, "签退提交反馈", "Feedback", feedback.id,
+            f"预约{booking_id}签退并提交反馈，综合评分{feedback.overall_rating}",
+            request
+        )
+        booking = crud.get_booking(db, booking_id)
+        return {
+            "message": "签退成功，反馈已提交",
+            "id": feedback.id,
+            "booking_id": feedback.booking_id,
+            "check_out_time": feedback.check_out_time,
+            "overall_rating": feedback.overall_rating,
+            "equipment_rating": feedback.equipment_rating,
+            "environment_rating": feedback.environment_rating,
+            "needs_follow_up": feedback.needs_follow_up,
+            "status": feedback.status,
+            "booking_status": booking.status if booking else None
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
+@router.get("/feedbacks/my", summary="获取我的反馈列表")
+async def get_my_feedbacks(
+    page: int = 1,
+    page_size: int = 50,
+    current_user: User = Depends(require_roles([UserRole.EXECUTOR, UserRole.ADMIN])),
+    db: Session = Depends(get_db)
+):
+    skip = (page - 1) * page_size
+    feedbacks, total = crud.list_feedbacks(db, user_id=current_user.id, skip=skip, limit=page_size)
+    items = []
+    for f in feedbacks:
+        booking = crud.get_booking(db, f.booking_id)
+        items.append({
+            "id": f.id,
+            "booking_id": f.booking_id,
+            "booking_info": {
+                "id": booking.id if booking else None,
+                "room_name": booking.room.name if booking and booking.room else "未知",
+                "start_time": booking.start_time if booking else None,
+                "end_time": booking.end_time if booking else None
+            } if booking else None,
+            "check_out_time": f.check_out_time,
+            "actual_usage": f.actual_usage,
+            "equipment_rating": f.equipment_rating,
+            "environment_rating": f.environment_rating,
+            "overall_rating": f.overall_rating,
+            "problem_description": f.problem_description,
+            "needs_follow_up": f.needs_follow_up,
+            "status": f.status,
+            "handling_result": f.handling_result,
+            "created_at": f.created_at
+        })
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "page_size": page_size
+    }
 
 
 # ==================== 我的黑名单记录 ====================

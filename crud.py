@@ -5,14 +5,16 @@ from sqlalchemy import and_, or_, func
 from models import (
     User, PracticeRoom, TimeSlot, BookingRule, Blacklist,
     Lock, Booking, AbnormalRecord, LockStatus, BookingStatus, UserRole,
-    Appeal, AppealStatus, AppealType, WaitlistEntry, WaitlistStatus
+    Appeal, AppealStatus, AppealType, WaitlistEntry, WaitlistStatus,
+    Feedback, FeedbackStatus
 )
 from schemas import (
     UserCreate, UserUpdate, PracticeRoomCreate, PracticeRoomUpdate,
     TimeSlotCreate, TimeSlotUpdate, BookingRuleUpdate,
     BlacklistCreate, BlacklistUpdate, LockCreate, LockExtend,
     BookingCreate, BookingCancel, AbnormalRecordCreate, AbnormalRecordConfirm,
-    PasswordChange, AppealCreate, AppealReview, WaitlistCreate, WaitlistCancel
+    PasswordChange, AppealCreate, AppealReview, WaitlistCreate, WaitlistCancel,
+    FeedbackSubmit, FeedbackHandle, FeedbackQueryParams
 )
 from auth import hash_password, verify_password
 
@@ -1547,3 +1549,186 @@ def get_waitlist_statistics(db: Session, days: int = 30) -> dict:
         "fulfillment_rate": round(fulfillment_rate, 2),
         "room_breakdown": room_stats
     }
+
+
+# ==================== Feedback CRUD ====================
+
+def check_out_and_submit_feedback(db: Session, booking_id: int, user_id: int, data: FeedbackSubmit) -> Feedback:
+    booking = get_booking(db, booking_id)
+    if not booking:
+        raise ValueError("预约记录不存在")
+    if booking.user_id != user_id:
+        raise ValueError("只能为自己的预约签退")
+
+    if booking.status == BookingStatus.CANCELLED:
+        raise ValueError("已取消的预约无法签退提交反馈")
+    if booking.status == BookingStatus.NO_SHOW:
+        raise ValueError("已爽约的预约无法签退提交反馈")
+    if booking.status == BookingStatus.ABNORMAL:
+        raise ValueError("已标记异常的预约无法签退提交反馈")
+    if booking.status != BookingStatus.CHECKED_IN:
+        raise ValueError("未签到的预约无法签退提交反馈")
+
+    existing_feedback = db.query(Feedback).filter(Feedback.booking_id == booking_id).first()
+    if existing_feedback:
+        raise ValueError("该预约已提交过反馈，请勿重复提交")
+
+    now = datetime.now()
+    booking.check_out_time = now
+
+    if not data.needs_follow_up:
+        status = FeedbackStatus.HANDLED
+    else:
+        status = FeedbackStatus.PENDING
+
+    feedback = Feedback(
+        booking_id=booking_id,
+        user_id=user_id,
+        check_out_time=now,
+        actual_usage=data.actual_usage,
+        equipment_rating=data.equipment_rating,
+        environment_rating=data.environment_rating,
+        overall_rating=data.overall_rating,
+        problem_description=data.problem_description,
+        needs_follow_up=data.needs_follow_up,
+        status=status
+    )
+
+    if not data.needs_follow_up:
+        feedback.handled_at = now
+
+    db.add(feedback)
+    db.commit()
+    db.refresh(feedback)
+    return feedback
+
+
+def get_feedback(db: Session, feedback_id: int) -> Optional[Feedback]:
+    return db.query(Feedback).filter(Feedback.id == feedback_id).first()
+
+
+def get_feedback_by_booking(db: Session, booking_id: int) -> Optional[Feedback]:
+    return db.query(Feedback).filter(Feedback.booking_id == booking_id).first()
+
+
+def list_feedbacks(
+    db: Session,
+    room_id: Optional[int] = None,
+    user_id: Optional[int] = None,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    min_rating: Optional[int] = None,
+    max_rating: Optional[int] = None,
+    status: Optional[FeedbackStatus] = None,
+    needs_follow_up: Optional[bool] = None,
+    skip: int = 0,
+    limit: int = 100
+) -> Tuple[List[Feedback], int]:
+    query = db.query(Feedback).join(Booking, Feedback.booking_id == Booking.id)
+
+    if room_id:
+        query = query.filter(Booking.room_id == room_id)
+    if user_id:
+        query = query.filter(Feedback.user_id == user_id)
+    if start_date:
+        query = query.filter(Feedback.check_out_time >= datetime.combine(start_date, datetime.min.time()))
+    if end_date:
+        query = query.filter(Feedback.check_out_time <= datetime.combine(end_date, datetime.max.time()))
+    if min_rating is not None:
+        query = query.filter(Feedback.overall_rating >= min_rating)
+    if max_rating is not None:
+        query = query.filter(Feedback.overall_rating <= max_rating)
+    if status:
+        query = query.filter(Feedback.status == status)
+    if needs_follow_up is not None:
+        query = query.filter(Feedback.needs_follow_up == needs_follow_up)
+
+    total = query.count()
+    feedbacks = query.order_by(Feedback.created_at.desc()).offset(skip).limit(limit).all()
+    return feedbacks, total
+
+
+def handle_feedback(db: Session, feedback_id: int, handler_id: int, data: FeedbackHandle) -> Feedback:
+    feedback = get_feedback(db, feedback_id)
+    if not feedback:
+        raise ValueError("反馈记录不存在")
+    if feedback.status == FeedbackStatus.HANDLED:
+        raise ValueError("该反馈已处理，无需重复处理")
+
+    feedback.status = FeedbackStatus.HANDLED
+    feedback.handled_by = handler_id
+    feedback.handled_at = datetime.now()
+    feedback.handling_result = data.handling_result
+
+    db.commit()
+    db.refresh(feedback)
+    return feedback
+
+
+def get_feedback_statistics(db: Session, days: int = 30) -> dict:
+    since = datetime.now() - timedelta(days=days)
+
+    total_count = db.query(Feedback).filter(Feedback.created_at >= since).count()
+    pending_count = db.query(Feedback).filter(
+        Feedback.created_at >= since,
+        Feedback.status == FeedbackStatus.PENDING
+    ).count()
+    handled_count = db.query(Feedback).filter(
+        Feedback.created_at >= since,
+        Feedback.status == FeedbackStatus.HANDLED
+    ).count()
+    needs_follow_up_count = db.query(Feedback).filter(
+        Feedback.created_at >= since,
+        Feedback.needs_follow_up == True
+    ).count()
+
+    avg_overall = db.query(func.avg(Feedback.overall_rating)).filter(
+        Feedback.created_at >= since
+    ).scalar() or 0
+    avg_equipment = db.query(func.avg(Feedback.equipment_rating)).filter(
+        Feedback.created_at >= since
+    ).scalar() or 0
+    avg_environment = db.query(func.avg(Feedback.environment_rating)).filter(
+        Feedback.created_at >= since
+    ).scalar() or 0
+
+    return {
+        "stat_days": days,
+        "total_count": total_count,
+        "pending_count": pending_count,
+        "handled_count": handled_count,
+        "needs_follow_up_count": needs_follow_up_count,
+        "avg_overall_rating": round(float(avg_overall), 2) if avg_overall else 0,
+        "avg_equipment_rating": round(float(avg_equipment), 2) if avg_equipment else 0,
+        "avg_environment_rating": round(float(avg_environment), 2) if avg_environment else 0
+    }
+
+
+def get_room_feedback_overview(db: Session, days: int = 30) -> List[dict]:
+    since = datetime.now() - timedelta(days=days)
+
+    query = db.query(
+        Booking.room_id,
+        func.count(Feedback.id).label('feedback_count'),
+        func.avg(Feedback.overall_rating).label('avg_rating'),
+        func.sum(func.case((Feedback.status == FeedbackStatus.PENDING, 1), else_=0)).label('pending_count')
+    ).join(
+        Feedback, Feedback.booking_id == Booking.id
+    ).filter(
+        Feedback.created_at >= since
+    ).group_by(
+        Booking.room_id
+    )
+
+    results = query.all()
+    overview = []
+    for row in results:
+        room = get_room(db, row.room_id)
+        overview.append({
+            "room_id": row.room_id,
+            "room_name": room.name if room else f"练习间{row.room_id}",
+            "feedback_count": int(row.feedback_count) if row.feedback_count else 0,
+            "avg_rating": round(float(row.avg_rating), 2) if row.avg_rating else 0,
+            "pending_issues_count": int(row.pending_count) if row.pending_count else 0
+        })
+    return overview

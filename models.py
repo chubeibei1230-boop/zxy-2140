@@ -180,6 +180,7 @@ class Booking(Base):
     lock = relationship("Lock", back_populates="booking")
     reviewer = relationship("User", foreign_keys=[reviewer_id])
     abnormal_records = relationship("AbnormalRecord", back_populates="booking", cascade="all, delete-orphan")
+    feedback = relationship("Feedback", back_populates="booking", uselist=False, cascade="all, delete-orphan")
 
 
 class AbnormalRecord(Base):
@@ -239,6 +240,36 @@ class OperationLog(Base):
     created_at = Column(DateTime, server_default=func.now(), index=True)
 
     operator = relationship("User", foreign_keys=[user_id])
+
+
+class FeedbackStatus(str, enum.Enum):
+    PENDING = "pending"
+    HANDLED = "handled"
+
+
+class Feedback(Base):
+    __tablename__ = "feedbacks"
+
+    id = Column(Integer, primary_key=True, index=True)
+    booking_id = Column(Integer, ForeignKey("bookings.id"), nullable=False, unique=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    check_out_time = Column(DateTime, nullable=False)
+    actual_usage = Column(Text)
+    equipment_rating = Column(Integer, nullable=False)
+    environment_rating = Column(Integer, nullable=False)
+    overall_rating = Column(Integer, nullable=False)
+    problem_description = Column(Text)
+    needs_follow_up = Column(Boolean, default=False)
+    status = Column(String(20), nullable=False, default=FeedbackStatus.PENDING)
+    handled_by = Column(Integer, ForeignKey("users.id"))
+    handled_at = Column(DateTime)
+    handling_result = Column(Text)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    booking = relationship("Booking", back_populates="feedback")
+    user = relationship("User", foreign_keys=[user_id])
+    handler = relationship("User", foreign_keys=[handled_by])
 
 
 class Appeal(Base):

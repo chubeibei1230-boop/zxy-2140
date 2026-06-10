@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session
 from datetime import datetime, date
 from database import get_db
-from models import User, UserRole, LockStatus, BookingStatus
+from models import User, UserRole, LockStatus, BookingStatus, FeedbackStatus
 from auth import get_current_user, require_roles
 import crud
 
@@ -359,4 +359,120 @@ async def get_operation_logs(
         "page": page,
         "page_size": page_size,
         "total_pages": (total + page_size - 1) // page_size if total > 0 else 0
+    }
+
+
+# ==================== 反馈查询与统计 ====================
+
+@router.get("/feedbacks", summary="反馈多条件查询")
+async def query_feedbacks(
+    room_id: int = None,
+    user_id: int = None,
+    start_date: date = None,
+    end_date: date = None,
+    min_rating: int = None,
+    max_rating: int = None,
+    status: FeedbackStatus = None,
+    needs_follow_up: bool = None,
+    page: int = 1,
+    page_size: int = 50,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    skip = (page - 1) * page_size
+    feedbacks, total = crud.list_feedbacks(
+        db,
+        room_id=room_id,
+        user_id=user_id,
+        start_date=start_date,
+        end_date=end_date,
+        min_rating=min_rating,
+        max_rating=max_rating,
+        status=status,
+        needs_follow_up=needs_follow_up,
+        skip=skip,
+        limit=page_size
+    )
+    items = []
+    for f in feedbacks:
+        booking = crud.get_booking(db, f.booking_id)
+        items.append({
+            "id": f.id,
+            "booking_id": f.booking_id,
+            "user_id": f.user_id,
+            "user_name": f.user.real_name if f.user else "未知",
+            "room_id": booking.room_id if booking else None,
+            "room_name": booking.room.name if booking and booking.room else "未知",
+            "check_out_time": f.check_out_time,
+            "actual_usage": f.actual_usage,
+            "equipment_rating": f.equipment_rating,
+            "environment_rating": f.environment_rating,
+            "overall_rating": f.overall_rating,
+            "problem_description": f.problem_description,
+            "needs_follow_up": f.needs_follow_up,
+            "status": f.status,
+            "handled_by_name": f.handler.real_name if f.handler else None,
+            "handled_at": f.handled_at,
+            "handling_result": f.handling_result,
+            "created_at": f.created_at,
+            "updated_at": f.updated_at
+        })
+    return {
+        "filters": {
+            "room_id": room_id,
+            "user_id": user_id,
+            "start_date": start_date,
+            "end_date": end_date,
+            "min_rating": min_rating,
+            "max_rating": max_rating,
+            "status": status,
+            "needs_follow_up": needs_follow_up
+        },
+        "items": items,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": (total + page_size - 1) // page_size if total > 0 else 0
+    }
+
+
+@router.get("/stats/feedback", summary="反馈总体统计")
+async def get_feedback_statistics(
+    days: int = Query(30, ge=1, le=365, description="统计天数"),
+    current_user: User = Depends(require_roles([UserRole.ADMIN, UserRole.REVIEWER])),
+    db: Session = Depends(get_db)
+):
+    stats = crud.get_feedback_statistics(db, days=days)
+    return {
+        "generated_at": datetime.now(),
+        **stats
+    }
+
+
+@router.get("/stats/room-feedback-overview", summary="各练习室反馈概览")
+async def get_room_feedback_overview(
+    days: int = Query(30, ge=1, le=365, description="统计天数"),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    overview = crud.get_room_feedback_overview(db, days=days)
+    overall_avg = 0
+    total_feedback = 0
+    total_pending = 0
+    for item in overview:
+        total_feedback += item["feedback_count"]
+        total_pending += item["pending_issues_count"]
+        overall_avg += item["avg_rating"] * item["feedback_count"]
+    overall_avg = round(overall_avg / total_feedback, 2) if total_feedback > 0 else 0
+
+    return {
+        "generated_at": datetime.now(),
+        "stat_days": days,
+        "summary": {
+            "total_feedback_count": total_feedback,
+            "overall_avg_rating": overall_avg,
+            "total_pending_issues": total_pending,
+            "rooms_with_feedback": len(overview)
+        },
+        "rooms": overview
     }
