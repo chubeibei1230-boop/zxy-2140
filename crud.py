@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, time
 from typing import Optional, List, Tuple
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, or_, func
@@ -338,6 +338,11 @@ def create_lock(db: Session, user_id: int, data: LockCreate) -> Lock:
         raise ValueError("练习间未启用")
 
     now = datetime.now()
+    if data.start_time < now:
+        raise ValueError("不能锁定已经开始的时段")
+    if data.end_time <= now:
+        raise ValueError("预约时间必须晚于当前时间")
+
     duration_hours = (data.end_time - data.start_time).total_seconds() / 3600
     if duration_hours < rule.min_booking_hours:
         raise ValueError(f"预约时长不能少于 {rule.min_booking_hours} 小时")
@@ -366,6 +371,29 @@ def create_lock(db: Session, user_id: int, data: LockCreate) -> Lock:
     conflicting_bookings = get_active_bookings_for_room(db, data.room_id, data.start_time, data.end_time)
     if conflicting_bookings:
         raise ValueError("该时段已有预约记录")
+
+    day_of_week = data.start_time.weekday()
+    target_date = data.start_time.date()
+    valid_slots = db.query(TimeSlot).filter(
+        TimeSlot.room_id == data.room_id,
+        TimeSlot.day_of_week == day_of_week,
+        TimeSlot.is_active == True
+    ).all()
+
+    slot_matched = False
+    for slot in valid_slots:
+        sh, sm = map(int, slot.start_time.split(':'))
+        eh, em = map(int, slot.end_time.split(':'))
+        slot_start = datetime.combine(target_date, time(sh, sm))
+        slot_end = datetime.combine(target_date, time(eh, em))
+        if data.start_time >= slot_start and data.end_time <= slot_end:
+            slot_matched = True
+            break
+
+    if not valid_slots:
+        raise ValueError("该练习间在此日期没有开放时段，无法锁定")
+    if not slot_matched:
+        raise ValueError("所请求的时段不在管理员开放的时段范围内，无法锁定")
 
     expires_at = now + timedelta(minutes=rule.lock_duration_minutes)
     lock = Lock(
@@ -461,35 +489,38 @@ def create_booking(db: Session, user_id: int, data: BookingCreate) -> Booking:
     if lock.expires_at <= datetime.now():
         raise ValueError("锁定已过期，请重新锁定")
 
-    if check_user_in_blacklist(db, user_id):
-        raise ValueError("您已被加入黑名单，无法预约")
+    try:
+        if check_user_in_blacklist(db, user_id):
+            raise ValueError("您已被加入黑名单，无法预约")
 
-    conflicting_bookings = get_active_bookings_for_room(
-        db, lock.room_id, lock.start_time, lock.end_time
-    )
-    if conflicting_bookings:
+        conflicting_bookings = get_active_bookings_for_room(
+            db, lock.room_id, lock.start_time, lock.end_time
+        )
+        if conflicting_bookings:
+            raise ValueError("该时段已被预约")
+
+        booking = Booking(
+            user_id=user_id,
+            room_id=lock.room_id,
+            lock_id=lock.id,
+            start_time=lock.start_time,
+            end_time=lock.end_time,
+            status=BookingStatus.CONFIRMED,
+            purpose=data.purpose
+        )
+        db.add(booking)
+        lock.status = LockStatus.CONVERTED
+        lock.released_at = datetime.now()
+        lock.release_reason = "成功转换为正式预约"
+        db.commit()
+        db.refresh(booking)
+        return booking
+    except ValueError:
         lock.status = LockStatus.RELEASED
         lock.released_at = datetime.now()
-        lock.release_reason = "创建预约时发现冲突，自动释放"
+        lock.release_reason = "创建预约失败，自动释放锁定"
         db.commit()
-        raise ValueError("该时段已被预约，锁定已自动释放")
-
-    booking = Booking(
-        user_id=user_id,
-        room_id=lock.room_id,
-        lock_id=lock.id,
-        start_time=lock.start_time,
-        end_time=lock.end_time,
-        status=BookingStatus.CONFIRMED,
-        purpose=data.purpose
-    )
-    db.add(booking)
-    lock.status = LockStatus.CONVERTED
-    lock.released_at = datetime.now()
-    lock.release_reason = "成功转换为正式预约"
-    db.commit()
-    db.refresh(booking)
-    return booking
+        raise
 
 
 def get_booking(db: Session, booking_id: int) -> Optional[Booking]:

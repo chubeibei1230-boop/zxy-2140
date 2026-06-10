@@ -13,7 +13,15 @@ class UserBase(BaseModel):
 
 class UserCreate(UserBase):
     password: str = Field(..., min_length=6, max_length=128)
-    role: UserRole = UserRole.EXECUTOR
+    role: UserRole = Field(default=UserRole.EXECUTOR, deprecated=True)
+
+
+class UserRegister(BaseModel):
+    username: str = Field(..., min_length=3, max_length=50)
+    password: str = Field(..., min_length=6, max_length=128)
+    real_name: str = Field(..., min_length=1, max_length=100)
+    phone: Optional[str] = None
+    email: Optional[str] = None
 
 
 class UserUpdate(BaseModel):

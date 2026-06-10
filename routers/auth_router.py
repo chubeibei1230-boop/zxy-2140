@@ -6,7 +6,7 @@ from database import get_db
 from models import User, UserRole
 from schemas import (
     UserCreate, UserUpdate, UserResponse, Token,
-    PasswordChange
+    PasswordChange, UserRegister
 )
 from auth import (
     get_current_user, require_roles, create_access_token,
@@ -18,9 +18,17 @@ router = APIRouter(prefix="/api/auth", tags=["认证"])
 
 
 @router.post("/register", response_model=Token, summary="用户注册")
-async def register(user_data: UserCreate, request: Request, db: Session = Depends(get_db)):
+async def register(user_data: UserRegister, request: Request, db: Session = Depends(get_db)):
     try:
-        user = crud.create_user(db, user_data)
+        create_data = UserCreate(
+            username=user_data.username,
+            password=user_data.password,
+            real_name=user_data.real_name,
+            role=UserRole.EXECUTOR,
+            phone=user_data.phone,
+            email=user_data.email
+        )
+        user = crud.create_user(db, create_data)
         log_operation(db, user.id, "用户注册", "User", user.id, f"新用户注册: {user.username}", request)
         access_token = create_access_token(
             data={"sub": str(user.id), "role": user.role},
