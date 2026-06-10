@@ -16,6 +16,7 @@ from routers.executor_router import router as executor_router
 from routers.reviewer_router import router as reviewer_router
 from routers.query_router import router as query_router
 from routers.appeal_router import router as appeal_router
+from routers.waitlist_router import router as waitlist_router
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -43,6 +44,17 @@ def scheduled_no_show_process():
         db.close()
     except Exception as e:
         logger.error(f"爽约自动处理异常: {e}")
+
+
+def scheduled_waitlist_expiry():
+    try:
+        db = SessionLocal()
+        count = crud.process_expired_waitlist(db)
+        if count > 0:
+            logger.info(f"自动失效了 {count} 个超时未确认的候补申请")
+        db.close()
+    except Exception as e:
+        logger.error(f"候补超时处理异常: {e}")
 
 
 def init_database():
@@ -97,7 +109,8 @@ def init_database():
                 max_daily_bookings=2,
                 advance_booking_days=7,
                 no_show_threshold=3,
-                auto_release_minutes=15
+                auto_release_minutes=15,
+                waitlist_confirm_minutes=15
             )
             db.add(rule)
             logger.info("创建默认预约规则")
@@ -189,6 +202,15 @@ async def lifespan(app: FastAPI):
     )
     logger.info("已启动爽约自动处理任务（每5分钟执行）")
 
+    scheduler.add_job(
+        scheduled_waitlist_expiry,
+        'interval',
+        minutes=1,
+        id='waitlist_expiry_job',
+        replace_existing=True
+    )
+    logger.info("已启动候补超时自动处理任务（每1分钟执行）")
+
     scheduler.start()
     logger.info("后台任务调度器已启动")
 
@@ -247,6 +269,7 @@ app.include_router(executor_router)
 app.include_router(reviewer_router)
 app.include_router(query_router)
 app.include_router(appeal_router)
+app.include_router(waitlist_router)
 
 
 @app.get("/", tags=["系统"], summary="健康检查")

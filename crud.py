@@ -5,14 +5,14 @@ from sqlalchemy import and_, or_, func
 from models import (
     User, PracticeRoom, TimeSlot, BookingRule, Blacklist,
     Lock, Booking, AbnormalRecord, LockStatus, BookingStatus, UserRole,
-    Appeal, AppealStatus, AppealType
+    Appeal, AppealStatus, AppealType, WaitlistEntry, WaitlistStatus
 )
 from schemas import (
     UserCreate, UserUpdate, PracticeRoomCreate, PracticeRoomUpdate,
     TimeSlotCreate, TimeSlotUpdate, BookingRuleUpdate,
     BlacklistCreate, BlacklistUpdate, LockCreate, LockExtend,
     BookingCreate, BookingCancel, AbnormalRecordCreate, AbnormalRecordConfirm,
-    PasswordChange, AppealCreate, AppealReview
+    PasswordChange, AppealCreate, AppealReview, WaitlistCreate, WaitlistCancel
 )
 from auth import hash_password, verify_password
 
@@ -34,7 +34,8 @@ def get_booking_rule(db: Session) -> BookingRule:
             max_daily_bookings=2,
             advance_booking_days=7,
             no_show_threshold=3,
-            auto_release_minutes=15
+            auto_release_minutes=15,
+            waitlist_confirm_minutes=15
         )
         db.add(rule)
         db.commit()
@@ -449,6 +450,9 @@ def release_lock(db: Session, lock_id: int, user_id: Optional[int] = None, reaso
     lock.release_reason = reason
     db.commit()
     db.refresh(lock)
+
+    trigger_waitlist_for_slot(db, lock.room_id, lock.start_time, lock.end_time)
+
     return lock
 
 
@@ -464,6 +468,7 @@ def expire_locks(db: Session) -> int:
         lock.released_at = now
         lock.release_reason = "超时自动释放"
         count += 1
+        trigger_waitlist_for_slot(db, lock.room_id, lock.start_time, lock.end_time)
     db.commit()
     return count
 
@@ -542,6 +547,9 @@ def cancel_booking(db: Session, booking_id: int, user_id: int, data: BookingCanc
     booking.cancel_reason = data.cancel_reason or "用户主动取消"
     db.commit()
     db.refresh(booking)
+
+    trigger_waitlist_for_slot(db, booking.room_id, booking.start_time, booking.end_time)
+
     return booking
 
 
@@ -584,6 +592,9 @@ def mark_no_show(db: Session, booking_id: int, reviewer_id: int, note: Optional[
     booking.reviewer_note = note
     db.commit()
     db.refresh(booking)
+
+    trigger_waitlist_for_slot(db, booking.room_id, booking.start_time, booking.end_time)
+
     return booking
 
 
@@ -641,6 +652,7 @@ def handle_duplicate_bookings(db: Session, booking_ids: List[int], reviewer_id: 
             booking.reviewer_id = reviewer_id
             db.commit()
             db.refresh(booking)
+            trigger_waitlist_for_slot(db, booking.room_id, booking.start_time, booking.end_time)
             results.append(booking)
     return results
 
@@ -681,6 +693,7 @@ def confirm_abnormal_record(db: Session, record_id: int, reviewer_id: int, data:
             booking.status = BookingStatus.ABNORMAL
             booking.reviewer_id = reviewer_id
             booking.reviewer_note = data.handling_result
+            trigger_waitlist_for_slot(db, booking.room_id, booking.start_time, booking.end_time)
 
     db.commit()
     db.refresh(record)
@@ -881,7 +894,8 @@ def get_available_slots(db: Session, room_id: int, target_date: date) -> List[di
             "is_available": is_available,
             "is_past": is_past,
             "lock_info": lock_info,
-            "booking_info": booking_info
+            "booking_info": booking_info,
+            "can_waitlist": not is_past and not is_available
         })
 
     return sorted(result, key=lambda x: x["start_time"])
@@ -1178,4 +1192,358 @@ def get_appeal_statistics(db: Session, days: int = 30) -> dict:
         "rejected_count": rejected_count,
         "approval_rate": round(approval_rate, 2),
         "type_breakdown": type_stats
+    }
+
+
+# ==================== Waitlist CRUD ====================
+
+def _get_waitlist_position(db: Session, room_id: int, start_time: datetime, end_time: datetime) -> int:
+    existing = db.query(WaitlistEntry).filter(
+        WaitlistEntry.room_id == room_id,
+        WaitlistEntry.status.in_([WaitlistStatus.PENDING, WaitlistStatus.NOTIFIED]),
+        WaitlistEntry.start_time < end_time,
+        WaitlistEntry.end_time > start_time
+    ).count()
+    return existing + 1
+
+
+def _is_slot_available(db: Session, room_id: int, start_time: datetime, end_time: datetime) -> bool:
+    conflicting_locks = get_active_locks_for_room(db, room_id, start_time, end_time)
+    if conflicting_locks:
+        return False
+    conflicting_bookings = get_active_bookings_for_room(db, room_id, start_time, end_time)
+    if conflicting_bookings:
+        return False
+    return True
+
+
+def create_waitlist_entry(db: Session, user_id: int, data: WaitlistCreate) -> WaitlistEntry:
+    rule = get_booking_rule(db)
+
+    if check_user_in_blacklist(db, user_id):
+        raise ValueError("您已被加入黑名单，无法提交候补申请")
+
+    no_show_count = get_user_no_show_count(db, user_id)
+    if no_show_count >= rule.no_show_threshold:
+        raise ValueError(f"您近期爽约次数过多（{no_show_count}次），暂时无法提交候补申请")
+
+    room = get_room(db, data.room_id)
+    if not room:
+        raise ValueError("练习间不存在")
+    if not room.is_active:
+        raise ValueError("练习间未启用")
+
+    now = datetime.now()
+    if data.start_time < now:
+        raise ValueError("不能对已经开始的时段提交候补申请")
+    if data.end_time <= now:
+        raise ValueError("候补时段必须晚于当前时间")
+
+    duration_hours = (data.end_time - data.start_time).total_seconds() / 3600
+    if duration_hours < rule.min_booking_hours:
+        raise ValueError(f"预约时长不能少于 {rule.min_booking_hours} 小时")
+    if duration_hours > rule.max_booking_hours:
+        raise ValueError(f"预约时长不能超过 {rule.max_booking_hours} 小时")
+
+    max_future_date = now + timedelta(days=rule.advance_booking_days)
+    if data.start_time > max_future_date:
+        raise ValueError(f"只能预约 {rule.advance_booking_days} 天以内的时段")
+
+    day_of_week = data.start_time.weekday()
+    target_date = data.start_time.date()
+    valid_slots = db.query(TimeSlot).filter(
+        TimeSlot.room_id == data.room_id,
+        TimeSlot.day_of_week == day_of_week,
+        TimeSlot.is_active == True
+    ).all()
+
+    slot_matched = False
+    for slot in valid_slots:
+        sh, sm = map(int, slot.start_time.split(':'))
+        eh, em = map(int, slot.end_time.split(':'))
+        slot_start = datetime.combine(target_date, time(sh, sm))
+        slot_end = datetime.combine(target_date, time(eh, em))
+        if data.start_time >= slot_start and data.end_time <= slot_end:
+            slot_matched = True
+            break
+
+    if not valid_slots:
+        raise ValueError("该练习间在此日期没有开放时段")
+    if not slot_matched:
+        raise ValueError("所请求的时段不在管理员开放的时段范围内")
+
+    if _is_slot_available(db, data.room_id, data.start_time, data.end_time):
+        raise ValueError("该时段当前可用，请直接锁定预约，无需候补")
+
+    existing_waitlist = db.query(WaitlistEntry).filter(
+        WaitlistEntry.user_id == user_id,
+        WaitlistEntry.room_id == data.room_id,
+        WaitlistEntry.status.in_([WaitlistStatus.PENDING, WaitlistStatus.NOTIFIED]),
+        WaitlistEntry.start_time < data.end_time,
+        WaitlistEntry.end_time > data.start_time
+    ).first()
+    if existing_waitlist:
+        raise ValueError("您已在该时段提交过候补申请，请勿重复提交")
+
+    user_active_waitlist = db.query(WaitlistEntry).filter(
+        WaitlistEntry.user_id == user_id,
+        WaitlistEntry.status.in_([WaitlistStatus.PENDING, WaitlistStatus.NOTIFIED])
+    ).count()
+    if user_active_waitlist >= rule.max_daily_bookings * 2:
+        raise ValueError("您的候补申请数量已达上限")
+
+    position = _get_waitlist_position(db, data.room_id, data.start_time, data.end_time)
+
+    entry = WaitlistEntry(
+        user_id=user_id,
+        room_id=data.room_id,
+        start_time=data.start_time,
+        end_time=data.end_time,
+        reason=data.reason,
+        status=WaitlistStatus.PENDING
+    )
+    db.add(entry)
+    db.commit()
+    db.refresh(entry)
+    return entry
+
+
+def get_waitlist_entry(db: Session, entry_id: int) -> Optional[WaitlistEntry]:
+    return db.query(WaitlistEntry).filter(WaitlistEntry.id == entry_id).first()
+
+
+def cancel_waitlist_entry(db: Session, entry_id: int, user_id: int, data: WaitlistCancel) -> WaitlistEntry:
+    entry = get_waitlist_entry(db, entry_id)
+    if not entry:
+        raise ValueError("候补记录不存在")
+    if entry.user_id != user_id:
+        raise ValueError("只能取消自己的候补申请")
+    if entry.status not in [WaitlistStatus.PENDING, WaitlistStatus.NOTIFIED]:
+        raise ValueError("当前状态无法取消候补")
+
+    was_notified = entry.status == WaitlistStatus.NOTIFIED
+    entry.status = WaitlistStatus.CANCELLED
+    entry.cancelled_at = datetime.now()
+    entry.cancel_reason = data.cancel_reason or "用户主动取消"
+    db.commit()
+    db.refresh(entry)
+
+    if was_notified:
+        _notify_next_waitlist(db, entry.room_id, entry.start_time, entry.end_time)
+
+    return entry
+
+
+def confirm_waitlist_entry(db: Session, entry_id: int, user_id: int) -> WaitlistEntry:
+    entry = get_waitlist_entry(db, entry_id)
+    if not entry:
+        raise ValueError("候补记录不存在")
+    if entry.user_id != user_id:
+        raise ValueError("只能确认自己的候补申请")
+    if entry.status != WaitlistStatus.NOTIFIED:
+        raise ValueError("当前状态无法确认候补")
+    if entry.confirm_deadline and datetime.now() > entry.confirm_deadline:
+        expire_waitlist_entry(db, entry_id)
+        raise ValueError("候补确认已超时，该机会已失效")
+
+    if check_user_in_blacklist(db, user_id):
+        raise ValueError("您已被加入黑名单，无法确认候补")
+
+    if not _is_slot_available(db, entry.room_id, entry.start_time, entry.end_time):
+        entry.status = WaitlistStatus.EXPIRED
+        entry.cancelled_at = datetime.now()
+        entry.cancel_reason = "确认时时段已被占用"
+        db.commit()
+        db.refresh(entry)
+        raise ValueError("该时段已被占用，候补确认失败")
+
+    rule = get_booking_rule(db)
+    lock = Lock(
+        user_id=user_id,
+        room_id=entry.room_id,
+        start_time=entry.start_time,
+        end_time=entry.end_time,
+        status=LockStatus.ACTIVE,
+        expires_at=datetime.now() + timedelta(minutes=rule.lock_duration_minutes)
+    )
+    db.add(lock)
+    db.flush()
+
+    booking = Booking(
+        user_id=user_id,
+        room_id=entry.room_id,
+        lock_id=lock.id,
+        start_time=entry.start_time,
+        end_time=entry.end_time,
+        status=BookingStatus.CONFIRMED,
+        purpose=f"候补预约: {entry.reason}"
+    )
+    db.add(booking)
+    db.flush()
+
+    lock.status = LockStatus.CONVERTED
+    lock.released_at = datetime.now()
+    lock.release_reason = "候补预约确认，自动转换为正式预约"
+
+    entry.status = WaitlistStatus.CONFIRMED
+    entry.confirmed_at = datetime.now()
+    entry.booking_id = booking.id
+    db.commit()
+    db.refresh(entry)
+
+    _notify_next_waitlist(db, entry.room_id, entry.start_time, entry.end_time)
+
+    return entry
+
+
+def expire_waitlist_entry(db: Session, entry_id: int) -> WaitlistEntry:
+    entry = get_waitlist_entry(db, entry_id)
+    if not entry:
+        raise ValueError("候补记录不存在")
+    if entry.status != WaitlistStatus.NOTIFIED:
+        return entry
+
+    entry.status = WaitlistStatus.EXPIRED
+    entry.cancelled_at = datetime.now()
+    entry.cancel_reason = "候补确认超时，自动失效"
+    db.commit()
+    db.refresh(entry)
+
+    _notify_next_waitlist(db, entry.room_id, entry.start_time, entry.end_time)
+
+    return entry
+
+
+def _notify_next_waitlist(db: Session, room_id: int, start_time: datetime, end_time: datetime):
+    overlapping_entries = db.query(WaitlistEntry).filter(
+        WaitlistEntry.room_id == room_id,
+        WaitlistEntry.status == WaitlistStatus.PENDING,
+        WaitlistEntry.start_time < end_time,
+        WaitlistEntry.end_time > start_time
+    ).order_by(WaitlistEntry.created_at.asc()).all()
+
+    for entry in overlapping_entries:
+        if _is_slot_available(db, room_id, entry.start_time, entry.end_time):
+            rule = get_booking_rule(db)
+            now = datetime.now()
+            entry.status = WaitlistStatus.NOTIFIED
+            entry.notified_at = now
+            entry.confirm_deadline = now + timedelta(minutes=rule.waitlist_confirm_minutes)
+            db.commit()
+            db.refresh(entry)
+            break
+
+
+def process_expired_waitlist(db: Session) -> int:
+    now = datetime.now()
+    expired_entries = db.query(WaitlistEntry).filter(
+        WaitlistEntry.status == WaitlistStatus.NOTIFIED,
+        WaitlistEntry.confirm_deadline < now
+    ).all()
+
+    count = 0
+    for entry in expired_entries:
+        entry.status = WaitlistStatus.EXPIRED
+        entry.cancelled_at = now
+        entry.cancel_reason = "候补确认超时，自动失效"
+        count += 1
+        _notify_next_waitlist(db, entry.room_id, entry.start_time, entry.end_time)
+
+    db.commit()
+    return count
+
+
+def list_waitlist_entries(
+    db: Session,
+    status: Optional[WaitlistStatus] = None,
+    room_id: Optional[int] = None,
+    user_id: Optional[int] = None,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    skip: int = 0,
+    limit: int = 100
+) -> Tuple[List[WaitlistEntry], int]:
+    query = db.query(WaitlistEntry)
+    if status:
+        query = query.filter(WaitlistEntry.status == status)
+    if room_id:
+        query = query.filter(WaitlistEntry.room_id == room_id)
+    if user_id:
+        query = query.filter(WaitlistEntry.user_id == user_id)
+    if start_date:
+        query = query.filter(WaitlistEntry.start_time >= datetime.combine(start_date, datetime.min.time()))
+    if end_date:
+        query = query.filter(WaitlistEntry.start_time <= datetime.combine(end_date, datetime.max.time()))
+    total = query.count()
+    entries = query.order_by(WaitlistEntry.created_at.desc()).offset(skip).limit(limit).all()
+    return entries, total
+
+
+def trigger_waitlist_for_slot(db: Session, room_id: int, start_time: datetime, end_time: datetime):
+    _notify_next_waitlist(db, room_id, start_time, end_time)
+
+
+def get_waitlist_position_for_entry(db: Session, entry: WaitlistEntry) -> int:
+    if entry.status not in [WaitlistStatus.PENDING, WaitlistStatus.NOTIFIED]:
+        return 0
+    position = db.query(WaitlistEntry).filter(
+        WaitlistEntry.room_id == entry.room_id,
+        WaitlistEntry.status.in_([WaitlistStatus.PENDING, WaitlistStatus.NOTIFIED]),
+        WaitlistEntry.start_time < entry.end_time,
+        WaitlistEntry.end_time > entry.start_time,
+        WaitlistEntry.created_at < entry.created_at
+    ).count()
+    return position + 1
+
+
+def get_waitlist_statistics(db: Session, days: int = 30) -> dict:
+    since = datetime.now() - timedelta(days=days)
+
+    total_count = db.query(WaitlistEntry).filter(WaitlistEntry.created_at >= since).count()
+    pending_count = db.query(WaitlistEntry).filter(
+        WaitlistEntry.created_at >= since,
+        WaitlistEntry.status == WaitlistStatus.PENDING
+    ).count()
+    notified_count = db.query(WaitlistEntry).filter(
+        WaitlistEntry.created_at >= since,
+        WaitlistEntry.status == WaitlistStatus.NOTIFIED
+    ).count()
+    confirmed_count = db.query(WaitlistEntry).filter(
+        WaitlistEntry.created_at >= since,
+        WaitlistEntry.status == WaitlistStatus.CONFIRMED
+    ).count()
+    expired_count = db.query(WaitlistEntry).filter(
+        WaitlistEntry.created_at >= since,
+        WaitlistEntry.status == WaitlistStatus.EXPIRED
+    ).count()
+    cancelled_count = db.query(WaitlistEntry).filter(
+        WaitlistEntry.created_at >= since,
+        WaitlistEntry.status == WaitlistStatus.CANCELLED
+    ).count()
+
+    fulfillment_rate = confirmed_count / total_count * 100 if total_count > 0 else 0
+
+    room_counts = db.query(
+        WaitlistEntry.room_id,
+        func.count(WaitlistEntry.id).label('count')
+    ).filter(
+        WaitlistEntry.created_at >= since
+    ).group_by(WaitlistEntry.room_id).all()
+
+    room_stats = {}
+    for room_id, c in room_counts:
+        room = get_room(db, room_id)
+        room_name = room.name if room else f"练习间{room_id}"
+        room_stats[room_name] = c
+
+    return {
+        "stat_days": days,
+        "total_count": total_count,
+        "pending_count": pending_count,
+        "notified_count": notified_count,
+        "confirmed_count": confirmed_count,
+        "expired_count": expired_count,
+        "cancelled_count": cancelled_count,
+        "fulfillment_rate": round(fulfillment_rate, 2),
+        "room_breakdown": room_stats
     }

@@ -40,6 +40,14 @@ class AppealStatus(str, enum.Enum):
     REJECTED = "rejected"
 
 
+class WaitlistStatus(str, enum.Enum):
+    PENDING = "pending"
+    NOTIFIED = "notified"
+    CONFIRMED = "confirmed"
+    EXPIRED = "expired"
+    CANCELLED = "cancelled"
+
+
 class User(Base):
     __tablename__ = "users"
 
@@ -58,6 +66,7 @@ class User(Base):
     bookings = relationship("Booking", back_populates="user", foreign_keys="Booking.user_id", cascade="all, delete-orphan")
     blacklist_records = relationship("Blacklist", back_populates="user", foreign_keys="Blacklist.user_id", cascade="all, delete-orphan")
     appeals = relationship("Appeal", back_populates="user", foreign_keys="Appeal.user_id", cascade="all, delete-orphan")
+    waitlist_entries = relationship("WaitlistEntry", back_populates="user", foreign_keys="WaitlistEntry.user_id", cascade="all, delete-orphan")
 
 
 class PracticeRoom(Base):
@@ -76,6 +85,7 @@ class PracticeRoom(Base):
     time_slots = relationship("TimeSlot", back_populates="room", cascade="all, delete-orphan")
     locks = relationship("Lock", back_populates="room", cascade="all, delete-orphan")
     bookings = relationship("Booking", back_populates="room", cascade="all, delete-orphan")
+    waitlist_entries = relationship("WaitlistEntry", back_populates="room", cascade="all, delete-orphan")
 
 
 class TimeSlot(Base):
@@ -103,6 +113,7 @@ class BookingRule(Base):
     advance_booking_days = Column(Integer, default=7)
     no_show_threshold = Column(Integer, default=3)
     auto_release_minutes = Column(Integer, default=15)
+    waitlist_confirm_minutes = Column(Integer, default=15)
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
@@ -188,6 +199,30 @@ class AbnormalRecord(Base):
     booking = relationship("Booking", back_populates="abnormal_records")
     reporter = relationship("User", foreign_keys=[reporter_id])
     confirmer = relationship("User", foreign_keys=[confirmed_by])
+
+
+class WaitlistEntry(Base):
+    __tablename__ = "waitlist_entries"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    room_id = Column(Integer, ForeignKey("practice_rooms.id"), nullable=False)
+    start_time = Column(DateTime, nullable=False, index=True)
+    end_time = Column(DateTime, nullable=False, index=True)
+    reason = Column(Text, nullable=False)
+    status = Column(String(20), nullable=False, default=WaitlistStatus.PENDING)
+    notified_at = Column(DateTime)
+    confirm_deadline = Column(DateTime)
+    confirmed_at = Column(DateTime)
+    cancelled_at = Column(DateTime)
+    cancel_reason = Column(Text)
+    booking_id = Column(Integer, ForeignKey("bookings.id"))
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    user = relationship("User", back_populates="waitlist_entries", foreign_keys=[user_id])
+    room = relationship("PracticeRoom", back_populates="waitlist_entries")
+    booking = relationship("Booking", foreign_keys=[booking_id])
 
 
 class OperationLog(Base):

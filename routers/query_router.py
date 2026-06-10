@@ -279,6 +279,14 @@ async def get_dashboard_stats(
         AbnormalRecord.is_confirmed == False
     ).count()
 
+    from models import WaitlistEntry, WaitlistStatus
+    pending_waitlist = db.query(WaitlistEntry).filter(
+        WaitlistEntry.status == WaitlistStatus.PENDING
+    ).count()
+    notified_waitlist = db.query(WaitlistEntry).filter(
+        WaitlistEntry.status == WaitlistStatus.NOTIFIED
+    ).count()
+
     upcoming_releases = crud.get_upcoming_releases(db, within_minutes=15)
 
     return {
@@ -297,7 +305,9 @@ async def get_dashboard_stats(
         },
         "pending_actions": {
             "pending_abnormal_records": pending_abnormal,
-            "upcoming_releases_15min": len(upcoming_releases)
+            "upcoming_releases_15min": len(upcoming_releases),
+            "pending_waitlist": pending_waitlist,
+            "notified_waitlist": notified_waitlist
         }
     }
 

@@ -1,7 +1,7 @@
 from pydantic import BaseModel, Field, field_validator
 from typing import Optional, List
 from datetime import datetime, date, time
-from models import UserRole, LockStatus, BookingStatus, AppealType, AppealStatus
+from models import UserRole, LockStatus, BookingStatus, AppealType, AppealStatus, WaitlistStatus
 
 
 class UserBase(BaseModel):
@@ -122,6 +122,7 @@ class BookingRuleBase(BaseModel):
     advance_booking_days: int = Field(default=7, ge=1, le=60)
     no_show_threshold: int = Field(default=3, ge=1, le=10)
     auto_release_minutes: int = Field(default=15, ge=5, le=60)
+    waitlist_confirm_minutes: int = Field(default=15, ge=5, le=60)
 
 
 class BookingRuleUpdate(BookingRuleBase):
@@ -278,6 +279,7 @@ class AvailableSlot(BaseModel):
     is_available: bool
     lock_info: Optional[dict] = None
     booking_info: Optional[dict] = None
+    can_waitlist: bool = False
 
 
 class BookingQueryParams(BaseModel):
@@ -378,6 +380,56 @@ class AppealResponse(BaseModel):
 class AppealQueryParams(BaseModel):
     status: Optional[AppealStatus] = None
     appeal_type: Optional[AppealType] = None
+    user_id: Optional[int] = None
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None
+
+
+class WaitlistCreate(BaseModel):
+    room_id: int
+    start_time: datetime
+    end_time: datetime
+    reason: str = Field(..., min_length=1, max_length=500)
+
+    @field_validator('end_time')
+    @classmethod
+    def end_after_start(cls, v, info):
+        if 'start_time' in info.data and v <= info.data['start_time']:
+            raise ValueError('end_time must be after start_time')
+        return v
+
+
+class WaitlistCancel(BaseModel):
+    cancel_reason: Optional[str] = None
+
+
+class WaitlistResponse(BaseModel):
+    id: int
+    user_id: int
+    user_name: str
+    room_id: int
+    room_name: str
+    start_time: datetime
+    end_time: datetime
+    reason: str
+    status: WaitlistStatus
+    position: int
+    notified_at: Optional[datetime]
+    confirm_deadline: Optional[datetime]
+    confirmed_at: Optional[datetime]
+    cancelled_at: Optional[datetime]
+    cancel_reason: Optional[str]
+    booking_id: Optional[int]
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class WaitlistQueryParams(BaseModel):
+    status: Optional[WaitlistStatus] = None
+    room_id: Optional[int] = None
     user_id: Optional[int] = None
     start_date: Optional[date] = None
     end_date: Optional[date] = None
